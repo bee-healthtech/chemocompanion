@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { PDFDownloadButton } from '@/components/pdf-download-button'
 
 interface Entry {
   id: string
@@ -44,6 +45,22 @@ const INTERFERENCE_LABELS: Record<number, string> = {
   4: 'Very much',
 }
 
+function getSeverityBadgeClasses(severity: number) {
+  switch (severity) {
+    case 0:
+      return "inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-gray-100 text-gray-700"
+    case 1:
+      return "inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-green-100 text-green-700"
+    case 2:
+      return "inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-amber-100 text-amber-800"
+    case 3:
+      return "inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-orange-100 text-orange-800"
+    case 4:
+      return "inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-red-100 text-red-700"
+    default:
+      return "inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-gray-100 text-gray-700"
+  }
+}
 export default async function PreVisitSummaryPage() {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
@@ -137,7 +154,7 @@ export default async function PreVisitSummaryPage() {
     s.cycleDays.sort((a, b) => a - b)
   }
 
-  // Group red-flag events by (symptom + day + rule) for cleaner display
+  // Group red-flag events by (symptom + day + rule)
   interface GroupedAlert {
     symptom_slug: string
     symptom_label: string
@@ -227,38 +244,63 @@ export default async function PreVisitSummaryPage() {
   const symptomsLogged = summaryMap.size
   const alertCount = groupedAlerts.length
   const daysWithSymptoms = sortedDays.length
+  const alertDaysCount = new Set(
+    groupedAlerts
+      .filter(a => a.cycle_day !== null)
+      .map(a => a.cycle_day)
+  ).size
 
-  // Auto-generated patient-reported summary paragraph
+  // Auto-generated patient-reported summary — data-first, clinical
   let summaryParagraph = ''
   if (totalEntries === 0) {
     summaryParagraph = 'No symptoms logged yet for this cycle.'
   } else {
     const parts: string[] = []
 
-    if (topByCount.length > 0) {
-      const topLabels = topByCount.map(s => s.label.toLowerCase()).join(' and ')
-      parts.push(
-        `During this cycle, the most frequently reported symptoms were ${topLabels}.`
-      )
-    }
-
+    // Lead with alerts if present
     if (groupedAlerts.length > 0) {
       const alertPhrase = groupedAlerts
         .map(a => {
-          const daySuffix = a.cycle_day !== null ? ` on Day ${a.cycle_day}` : ''
           const count = a.events.length
-          return `${count} ${a.symptom_label.toLowerCase()} entr${count === 1 ? 'y' : 'ies'}${daySuffix} triggered ${a.rule_severity === 'emergency' ? 'urgent ' : ''}safety alerts`
+          const values = a.events
+            .filter(e => e.numeric_value !== null)
+            .map(e => `${e.numeric_value}${e.numeric_unit ?? ''}`)
+            .join(', ')
+          const dayPart = a.cycle_day !== null ? ` on Day ${a.cycle_day}` : ''
+          const valuePart = values ? ` at ${values}` : ''
+          return `${count} ${a.symptom_label.toLowerCase()} alert${count === 1 ? '' : 's'} recorded${dayPart}${valuePart}`
         })
         .join('; ')
       parts.push(alertPhrase.charAt(0).toUpperCase() + alertPhrase.slice(1) + '.')
     }
 
-    const peakSeverities = Array.from(summaryMap.values())
+    // Then top non-alert symptoms with severity
+    const nonAlertSymptoms = Array.from(summaryMap.values())
       .filter(s => s.peakSeverity !== null)
-      .map(s => s.peakSeverity!)
-    if (peakSeverities.length > 0) {
-      const overallPeak = Math.max(...peakSeverities)
-      parts.push(`Highest severity reported: ${SEVERITY_LABELS[overallPeak]}.`)
+      .filter(s => !groupedAlerts.some(a => a.symptom_slug === s.slug))
+      .sort((a, b) => (b.peakSeverity ?? 0) - (a.peakSeverity ?? 0))
+      .slice(0, 2)
+
+    if (nonAlertSymptoms.length > 0) {
+      const phrase = nonAlertSymptoms
+        .map(s => {
+          const interfPart = s.peakInterference !== null && s.peakInterference > 0
+            ? ` with ${INTERFERENCE_LABELS[s.peakInterference].toLowerCase()} interference`
+            : s.peakInterference === 0
+              ? ' with no interference'
+              : ''
+          return `${s.label.toLowerCase()} reported ${s.count === 1 ? 'once' : `${s.count} times`} as ${SEVERITY_LABELS[s.peakSeverity!].toLowerCase()}${interfPart}`
+        })
+        .join('; ')
+      parts.push(phrase.charAt(0).toUpperCase() + phrase.slice(1) + '.')
+    }
+
+    // Fallback if no alerts and no severity data
+    if (parts.length === 0 && topByCount.length > 0) {
+      const topLabels = topByCount.map(s => s.label.toLowerCase()).join(' and ')
+      parts.push(
+         `During this cycle, the most frequently reported symptoms were ${topLabels}.`
+        )
     }
 
     summaryParagraph = parts.join(' ')
@@ -270,43 +312,99 @@ export default async function PreVisitSummaryPage() {
     day: 'numeric',
   })
 
+  const pdfEntries = entriesWithLabels.map(e => ({
+  id: e.id,
+  symptom_slug: e.symptom_slug,
+  symptom_label: e.symptom_label,
+  occurred_on: e.occurred_on,
+  cycle_day: e.cycle_day,
+  severity: e.severity,
+  interference: e.interference,
+  numeric_value: e.numeric_value,
+  numeric_unit: e.numeric_unit,
+  note: e.note,
+  red_flag_triggered: e.red_flag_triggered,
+  logged_by: e.logged_by,
+  logged_at: e.logged_at,
+}))
+const pdfRedFlagEvents = groupedAlerts.flatMap(group =>
+  group.events.map(event => ({
+    rule_slug: group.rule_slug,
+    rule_severity: group.rule_severity,
+    triggered_at: event.triggered_at,
+    acknowledgment_choice: event.acknowledgment_choice,
+    symptom_label: group.symptom_label,
+    cycle_day: group.cycle_day,
+  }))
+)
   return (
-    <main className="min-h-screen bg-muted/40 p-4 md:p-8">
-      <div className="max-w-3xl mx-auto">
+    <main className="min-h-screen bg-gradient-to-b from-slate-50 to-white p-4 md:p-10">
+  <div className="max-w-4xl mx-auto bg-white shadow-sm border border-gray-200 rounded-2xl p-6 md:...">
+
+    {/* Page header */}
+    <div className="mb-8">
+      <h1 className="text-3xl md:text-4xl font-semibold text-teal-900 tracking-tight">
+        Pre-Visit Summary
+      </h1>
+      <p className="text-sm text-slate-600 mt-2">
+        A clear overview to help you prepare for your next clinical visit
+      </p>
+    </div>
+
+
         {/* Action bar — not part of the printable document */}
-        <div className="flex items-center justify-between mb-4">
-          <Link
-            href="/home"
-            className="text-sm text-muted-foreground hover:underline"
-          >
-            ← Back
-          </Link>
-          <Button variant="outline" disabled>
-            Download PDF (coming next)
-          </Button>
-        </div>
+        <div className="flex items-center justify-between mb-6">
+  <Link
+    href="/home"
+    className="text-sm text-muted-foreground hover:underline"
+  >
+    ← Back
+  </Link>
+
+  <div className="bg-teal-50 border border-teal-100 px-4 py-2 rounded-lg">
+    <PDFDownloadButton
+      patientName={profile.display_name}
+      cycleNumber={cycleNumber}
+      cycleLength={profile.cycle_length_days ?? 21}
+      entries={pdfEntries}
+      redFlagEvents={pdfRedFlagEvents}
+      generatedAt={generatedAt}
+    />
+  </div>
+</div>
 
         {/* The document */}
-        <Card className="p-8 md:p-12 shadow-sm bg-white">
+        <Card className="p-8 md:p-10 bg-white border border-gray-200 shadow-lg rounded-2xl">
           {/* Document header — document-first, brand secondary */}
-          <div className="border-b border-gray-300 pb-4 mb-6">
-            <h1 className="text-xl font-bold text-gray-900">
-              Pre-Visit Symptom Summary
-            </h1>
-            <p className="text-xs text-gray-500 mt-1">
-              Generated by ChemoCompanion
-            </p>
-            <div className="mt-3 flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-1">
-              <p className="text-sm text-gray-700">
-                <span className="font-semibold">{profile.display_name}</span>
-                {' — '}
-                Cycle {cycleNumber}
-                {firstDay !== null && lastDay !== null && (
-                  <>, Day {firstDay}{firstDay !== lastDay && ` through Day ${lastDay}`}</>
-                )}
-              </p>
-              <p className="text-xs text-gray-500">Generated: {generatedAt}</p>
-            </div>
+          <div className="border-b border-teal-100 pb-6 mb-6">
+  <h2 className="text-2xl font-semibold text-teal-900">
+    Pre-Visit Symptom Summary
+  </h2>
+  <p className="text-sm text-teal-700 mt-1">
+    Generated by ChemoCompanion
+  </p>
+           <div className="mt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+  <div className="flex items-center gap-3 flex-wrap">
+    <div className="h-9 w-9 rounded-full bg-teal-100 flex items-center justify-center text-sm font-semibold text-teal-700">
+      {profile.display_name?.charAt(0).toUpperCase()}
+    </div>
+
+    <span className="text-base font-semibold text-slate-800">
+      {profile.display_name}
+    </span>
+
+    <span className="text-slate-300">•</span>
+
+    <span className="inline-flex items-center rounded-md bg-teal-50 px-2.5 py-1 text-xs font-medium text-teal-700">
+      Cycle {cycleNumber}
+      {firstDay !== null && lastDay !== null && (
+        <> • Day {firstDay}{firstDay !== lastDay && `–${lastDay}`}</>
+      )}
+    </span>
+  </div>
+
+  <p className="text-xs text-gray-400">Generated: {generatedAt}</p>
+</div> 
           </div>
 
           {totalEntries === 0 ? (
@@ -324,24 +422,26 @@ export default async function PreVisitSummaryPage() {
           ) : (
             <>
               {/* Compact numeric indicators */}
-              <div className="grid grid-cols-4 gap-2 mb-5 pb-5 border-b border-gray-200">
-                <div>
-                  <p className="text-[10px] uppercase tracking-wider text-gray-500">Entries</p>
-                  <p className="text-xl font-semibold text-gray-900">{totalEntries}</p>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 pb-6 border-b border-slate-200">
+                <div className="rounded-lg border border-teal-100 bg-teal-50 p-4">
+                  <p className="text-[10px] uppercase tracking-wider text-teal-700">Entries</p>
+                  <p className="text-2xl font-semibold text-teal-900">{totalEntries}</p>
                 </div>
-                <div>
-                  <p className="text-[10px] uppercase tracking-wider text-gray-500">Symptoms</p>
-                  <p className="text-xl font-semibold text-gray-900">{symptomsLogged}</p>
+                <div className="rounded-lg border border-sky-100 bg-sky-50 p-4">
+                  <p className="text-[10px] uppercase tracking-wider text-sky-700">Symptoms</p>
+                  <p className="text-2xl font-semibold text-sky-900">{symptomsLogged}</p>
                 </div>
-                <div>
-                  <p className="text-[10px] uppercase tracking-wider text-gray-500">Alerts</p>
-                  <p className={`text-xl font-semibold ${alertCount > 0 ? 'text-red-700' : 'text-gray-900'}`}>
-                    {alertCount}
-                  </p>
+                <div className="rounded-lg border border-red-100 bg-red-50 p-4">
+                  <p className="text-[10px] uppercase tracking-wider text-red-700">Alerts</p>
+                 <p className="text-2xl font-semibold text-red-700">
+  {alertCount}
+</p> 
                 </div>
-                <div>
-                  <p className="text-[10px] uppercase tracking-wider text-gray-500">Active days</p>
-                  <p className="text-xl font-semibold text-gray-900">{daysWithSymptoms}</p>
+                <div className="rounded-lg border border-amber-100 bg-amber-50 p-4">
+                  <p className="text-[10px] uppercase tracking-wider text-amber-700">Days with alerts</p>
+                  <p className="text-2xl font-semibold text-amber-800">
+  {alertDaysCount}
+</p>
                 </div>
               </div>
 
@@ -354,6 +454,24 @@ export default async function PreVisitSummaryPage() {
                   {summaryParagraph}
                 </p>
               </section>
+
+              {/* At-a-glance — high-value signal, near the top */}
+              {highestSeverity.length > 0 && (
+                <section className="mb-6 text-sm text-gray-700">
+                  <div className="flex flex-wrap gap-x-6 gap-y-1">
+                    <p>
+                      <span className="font-medium text-gray-500">Highest severity:</span>{' '}
+                      {SEVERITY_LABELS[highestSeverity[0].peakSeverity!]} ({highestSeverity[0].label.toLowerCase()})
+                    </p>
+                    {topByCount.length > 0 && (
+                      <p>
+                        <span className="font-medium text-gray-500">Most reported:</span>{' '}
+                        {topByCount[0].label.toLowerCase()} ({topByCount[0].count}x)
+                      </p>
+                    )}
+                  </div>
+                </section>
+              )}
 
               {/* Safety alerts — visually dominant */}
               {groupedAlerts.length > 0 && (
@@ -415,11 +533,11 @@ export default async function PreVisitSummaryPage() {
                 <div className="border border-gray-200 rounded">
                   {/* Header row */}
                   <div className="grid grid-cols-12 gap-2 px-3 py-2 bg-gray-50 border-b border-gray-200 text-[10px] uppercase tracking-wider text-gray-500 font-semibold">
-                    <div className="col-span-5">Symptom</div>
-                    <div className="col-span-1 text-right">#</div>
-                    <div className="col-span-2">Peak severity</div>
-                    <div className="col-span-2">Peak interf.</div>
-                    <div className="col-span-2">Days</div>
+                    <div className="col-span-4">Symptom</div>
+<div className="col-span-2 text-right">TIMES</div>
+<div className="col-span-2">Peak severity</div>
+<div className="col-span-2">Peak interf.</div>
+<div className="col-span-2">Days</div>
                   </div>
                   {/* Data rows */}
                   {Array.from(summaryMap.values())
@@ -429,39 +547,33 @@ export default async function PreVisitSummaryPage() {
                         key={s.slug}
                         className="grid grid-cols-12 gap-2 px-3 py-2 border-b border-gray-100 last:border-b-0 text-sm text-gray-800"
                       >
-                        <div className="col-span-5 font-medium">{s.label}</div>
-                        <div className="col-span-1 text-right">{s.count}</div>
+                        <div className="col-span-4 font-medium">{s.label}</div>
+                        <div className="col-span-2 text-right">{s.count}</div>
                         <div className="col-span-2 text-gray-600">
-                          {s.peakSeverity !== null ? SEVERITY_LABELS[s.peakSeverity] : '—'}
+  {s.peakSeverity !== null ? (
+    <span className={getSeverityBadgeClasses(s.peakSeverity)}>
+      {SEVERITY_LABELS[s.peakSeverity]}
+    </span>
+  ) : (
+    <span className="italic text-gray-400">Not reported</span>
+  )}
+</div>
+                        <div className="col-span-2 text-gray-600">
+                          {s.peakInterference !== null ? (
+  <span className="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-slate-100 text-slate-700">
+    {INTERFERENCE_LABELS[s.peakInterference]}
+  </span>
+) : (
+  <span className="italic text-gray-400">Not reported</span>
+)}
                         </div>
                         <div className="col-span-2 text-gray-600">
-                          {s.peakInterference !== null ? INTERFERENCE_LABELS[s.peakInterference] : '—'}
-                        </div>
-                        <div className="col-span-2 text-gray-600">
-                          {s.cycleDays.length > 0 ? s.cycleDays.join(', ') : '—'}
+                          {s.cycleDays.length > 0 ? s.cycleDays.join(', ') : <span className="text-gray-400 italic">—</span>}
                         </div>
                       </div>
                     ))}
                 </div>
               </section>
-
-              {/* Top-level "at a glance" secondary info */}
-              {highestSeverity.length > 0 && (
-                <section className="mb-6 text-sm text-gray-700">
-                  <div className="flex flex-wrap gap-x-6 gap-y-1">
-                    <p>
-                      <span className="font-medium text-gray-500">Highest severity:</span>{' '}
-                      {SEVERITY_LABELS[highestSeverity[0].peakSeverity!]} ({highestSeverity[0].label.toLowerCase()})
-                    </p>
-                    {topByCount.length > 0 && (
-                      <p>
-                        <span className="font-medium text-gray-500">Most reported:</span>{' '}
-                        {topByCount[0].label.toLowerCase()} ({topByCount[0].count}x)
-                      </p>
-                    )}
-                  </div>
-                </section>
-              )}
 
               {/* Notes by cycle day */}
               {notes.length > 0 && (
@@ -480,6 +592,27 @@ export default async function PreVisitSummaryPage() {
                   </div>
                 </section>
               )}
+
+              {/* Pattern note — descriptive observations only */}
+              {groupedAlerts.length > 0 && (() => {
+                const alertDays = Array.from(new Set(groupedAlerts.map(a => a.cycle_day).filter(d => d !== null))) as number[]
+                const alertSymptomLabels = Array.from(new Set(groupedAlerts.map(a => a.symptom_label.toLowerCase())))
+                if (alertDays.length === 1 && alertSymptomLabels.length === 1) {
+                  return (
+  <section className="mb-6">
+    <div className="flex items-start gap-3 rounded-md border border-blue-100 bg-blue-50/50 px-4 py-3 text-sm text-gray-800">
+      <div className="mt-0.5 text-blue-400 text-xs">●</div>
+
+      <p className="leading-relaxed">
+        All <span className="font-medium">fever or chills</span> alert entries 
+        clustered on <span className="font-semibold text-gray-900">Day 21</span>.
+      </p>
+    </div>
+  </section>
+)
+                }
+                return null
+              })()}
 
               {/* Entries by cycle day — tighter, lower visual weight */}
               <section className="mb-6">
